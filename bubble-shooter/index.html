@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>버블 슈터</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0d26; user-select: none; -webkit-user-select: none; }
+  body { font-family: "Arial Black", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
+  #wrap { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); box-shadow: 0 0 40px rgba(0,0,0,.6); }
+  canvas { display: block; cursor: crosshair; }
+  #result { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center;
+            background: rgba(6, 8, 30, .62); color: #fff; text-align: center; }
+  #result.show { display: flex; animation: fadein .35s ease-out; }
+  @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+  #resTitle { font-size: 44px; letter-spacing: 2px; margin-bottom: 10px; -webkit-text-stroke: 2px #1a1240;
+              text-shadow: 0 4px 0 #1a1240, 0 0 18px rgba(255,255,255,.35); }
+  #resTitle.clear { color: #ffe23a; }
+  #resTitle.over  { color: #ff5a5a; }
+  #resScoreLabel { font-size: 14px; color: #9fb4ff; letter-spacing: 3px; margin-top: 8px; }
+  #resScore { font-size: 34px; color: #fff; margin: 4px 0 26px; text-shadow: 0 3px 0 #1a1240; }
+  #retry { font: inherit; font-size: 20px; color: #fff; padding: 12px 34px; border-radius: 40px; cursor: pointer;
+           border: 3px solid #fff; background: radial-gradient(circle at 35% 25%, #8fd0ff 0%, #2a6cf0 45%, #133a9a 100%);
+           box-shadow: 0 5px 0 #0b1f5c, 0 0 20px rgba(80,160,255,.6); text-shadow: 0 2px 0 #0b1f5c; }
+  #retry:hover { filter: brightness(1.15); }
+  #retry:active { transform: translateY(3px); box-shadow: 0 2px 0 #0b1f5c; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+  <div id="result">
+    <div id="resTitle">CLEAR!</div>
+    <div id="resScoreLabel">SCORE</div>
+    <div id="resScore">0</div>
+    <button id="retry">다시하기</button>
+  </div>
+</div>
+<script>
+'use strict';
+// ───────────── 기본 치수 (원작: 가로 8칸 / 7칸 교차, 세로 12줄) ─────────────
+const W = 432, H = 680;
+const R = 22, D = R * 2, COLS = 8, ROWH = R * Math.sqrt(3);
+const FX = (W - COLS * D) / 2;            // 필드 왼쪽
+const FW = COLS * D;
+const FY = 64;                            // 천장 기본 위치
+const MAX_ROWS = 12;                      // 이 줄 수를 넘으면 게임오버
+const ROWS_MAX = 20;                      // 격자 저장 크기
+const DEADY = FY + D + (MAX_ROWS - 1) * ROWH;
+const LX = FX + FW / 2, LY = DEADY + 74;
+const NEXT_X = FX + 54, NEXT_Y = LY + 36;
+const SPEED = 1000;                       // px/s
+const MIN_ANGLE = 8 * Math.PI / 180;      // 수평 근처 조준 금지
+const SHOTS_PER_DROP = 8;                 // 8발마다 천장 하강
+const HURRY_AT = 5, AUTOFIRE_AT = 10;     // 대기 시간(초)
+const START_ROWS = 6;
+// 원작 8색: 빨강, 노랑, 파랑, 초록, 보라, 주황, 하양(은색), 검정
+const COLORS = ['#e8262e', '#f7cc1e', '#2a6cf0', '#2fbf4a', '#9a46d8', '#f5841f', '#e4e6ef', '#40404e'];
+const NC = COLORS.length;
+
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const wrap = document.getElementById('wrap');
+const resultEl = document.getElementById('result');
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const s = Math.max(0.4, Math.min((innerWidth - 16) / W, (innerHeight - 16) / H));
+  const cw = Math.round(W * s), ch = Math.round(H * s);
+  wrap.style.width = cw + 'px'; wrap.style.height = ch + 'px';
+  cv.style.width = cw + 'px'; cv.style.height = ch + 'px';
+  cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr);
+}
+addEventListener('resize', resize);
+resize();
+
+// ───────────── 색 유틸 ─────────────
+function hexRgb(h) { const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+function mix(h, t, k) { const a = hexRgb(h), b = hexRgb(t); return `rgb(${a.map((v, i) => Math.round(v + (b[i] - v) * k)).join(',')})`; }
+
+// ───────────── 구슬 스프라이트 (광택 구슬) ─────────────
+const SPR_SCALE = 3, SPR_SIZE = D + 6;
+function makeBubble(color) {
+  const c = document.createElement('canvas');
+  c.width = c.height = SPR_SIZE * SPR_SCALE;
+  const g = c.getContext('2d');
+  g.scale(SPR_SCALE, SPR_SCALE);
+  const cx = SPR_SIZE / 2, cy = SPR_SIZE / 2, r = R - 0.5;
+  // 그림자
+  g.beginPath(); g.arc(cx + 1, cy + 2, r, 0, 7); g.fillStyle = 'rgba(0,0,0,.28)'; g.fill();
+  // 본체
+  const body = g.createRadialGradient(cx - r * .35, cy - r * .4, r * .05, cx, cy, r * 1.02);
+  body.addColorStop(0, mix(color, '#ffffff', .65));
+  body.addColorStop(.35, mix(color, '#ffffff', .12));
+  body.addColorStop(.75, color);
+  body.addColorStop(1, mix(color, '#000000', .55));
+  g.beginPath(); g.arc(cx, cy, r, 0, 7); g.fillStyle = body; g.fill();
+  // 반사광 테두리 (아래쪽)
+  const rim = g.createRadialGradient(cx, cy - r * .3, r * .6, cx, cy, r);
+  rim.addColorStop(0, 'rgba(255,255,255,0)');
+  rim.addColorStop(.85, 'rgba(255,255,255,0)');
+  rim.addColorStop(1, 'rgba(255,255,255,.25)');
+  g.fillStyle = rim; g.fill();
+  // 외곽선
+  g.lineWidth = 1.4; g.strokeStyle = mix(color, '#000000', .7); g.stroke();
+  // 주 하이라이트
+  g.save();
+  g.translate(cx - r * .33, cy - r * .42); g.rotate(-.65);
+  const hl = g.createRadialGradient(0, 0, 0, 0, 0, r * .42);
+  hl.addColorStop(0, 'rgba(255,255,255,.98)');
+  hl.addColorStop(.55, 'rgba(255,255,255,.75)');
+  hl.addColorStop(1, 'rgba(255,255,255,0)');
+  g.scale(1, .58);
+  g.beginPath(); g.arc(0, 0, r * .42, 0, 7); g.fillStyle = hl; g.fill();
+  g.restore();
+  // 작은 점 하이라이트
+  g.beginPath(); g.arc(cx + r * .42, cy + r * .44, r * .11, 0, 7); g.fillStyle = 'rgba(255,255,255,.45)'; g.fill();
+  return c;
+}
+const SPR = COLORS.map(makeBubble);
+const SPR_GRAY = makeBubble('#7d7f8c');
+const SPR_WHITE = makeBubble('#ffffff');
+function drawBubble(spr, x, y, s = 1, alpha = 1) {
+  const sz = SPR_SIZE * s;
+  if (alpha !== 1) ctx.globalAlpha = alpha;
+  ctx.drawImage(spr, x - sz / 2, y - sz / 2, sz, sz);
+  if (alpha !== 1) ctx.globalAlpha = 1;
+}
+
+// ───────────── 배경 미리 그리기 ─────────────
+const bg = document.createElement('canvas');
+(function buildBg() {
+  const S = 2; bg.width = W * S; bg.height = H * S;
+  const g = bg.getContext('2d'); g.scale(S, S);
+  // 바깥 배경: 원작풍 패턴
+  let gr = g.createLinearGradient(0, 0, 0, H);
+  gr.addColorStop(0, '#2b1d6e'); gr.addColorStop(1, '#0f2a6a');
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  g.fillStyle = 'rgba(255,255,255,.06)';
+  for (let y = 0; y < H + 24; y += 24) for (let x = (y / 24 % 2) * 12; x < W + 24; x += 24) {
+    g.beginPath(); g.moveTo(x, y - 8); g.lineTo(x + 8, y); g.lineTo(x, y + 8); g.lineTo(x - 8, y); g.fill();
+  }
+  // 필드 안쪽
+  gr = g.createLinearGradient(0, FY, 0, H);
+  gr.addColorStop(0, '#0c1446'); gr.addColorStop(.75, '#16246a'); gr.addColorStop(1, '#1d2f7a');
+  g.fillStyle = gr; g.fillRect(FX, FY, FW, H - FY);
+  // 필드 안 은은한 육각 점
+  g.fillStyle = 'rgba(140,170,255,.07)';
+  for (let r = 0; r < 16; r++) for (let c = 0; c < (r & 1 ? 7 : 8); c++) {
+    g.beginPath(); g.arc(FX + R + c * D + (r & 1 ? R : 0), FY + R + r * ROWH, 3, 0, 7); g.fill();
+  }
+  // 좌우 금속 프레임
+  for (const x0 of [FX - 14, FX + FW]) {
+    gr = g.createLinearGradient(x0, 0, x0 + 14, 0);
+    gr.addColorStop(0, '#5d6274'); gr.addColorStop(.35, '#e6e9f2'); gr.addColorStop(.6, '#a3a8ba'); gr.addColorStop(1, '#3d4152');
+    g.fillStyle = gr; g.fillRect(x0, FY - 6, 14, H - FY + 6);
+    for (let y = FY + 20; y < H; y += 56) {
+      g.beginPath(); g.arc(x0 + 7, y, 2.6, 0, 7); g.fillStyle = '#4a4e60'; g.fill();
+      g.beginPath(); g.arc(x0 + 6.3, y - .7, 1.2, 0, 7); g.fillStyle = '#fff'; g.fill();
+    }
+  }
+  // 상단 HUD 패널
+  gr = g.createLinearGradient(0, 0, 0, FY);
+  gr.addColorStop(0, '#2a2f55'); gr.addColorStop(1, '#141836');
+  g.fillStyle = gr; g.fillRect(FX - 14, 6, FW + 28, FY - 12);
+  g.strokeStyle = '#8f96b8'; g.lineWidth = 2; g.strokeRect(FX - 13, 7, FW + 26, FY - 14);
+})();
+
+// ───────────── 사운드 (WebAudio 합성) ─────────────
+let AC = null, master = null, noiseBuf = null;
+function audioInit() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = .4; master.connect(AC.destination);
+    noiseBuf = AC.createBuffer(1, AC.sampleRate, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { AC = null; }
+}
+function tone({ type = 'sine', f0, f1, dur, vol = .3, delay = 0, attack = .004 }) {
+  if (!AC) return;
+  const t = AC.currentTime + delay;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t);
+  if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + attack);
+  g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + .03);
+}
+function noise({ dur, vol = .2, delay = 0, freq = 1000, type = 'lowpass', q = 1 }) {
+  if (!AC) return;
+  const t = AC.currentTime + delay;
+  const s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  s.buffer = noiseBuf; f.type = type; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t); s.stop(t + dur + .03);
+}
+const SFX = {
+  shoot()  { tone({ type: 'square', f0: 880, f1: 260, dur: .09, vol: .09 }); noise({ dur: .07, vol: .12, freq: 2500, type: 'highpass' }); },
+  bounce() { tone({ type: 'triangle', f0: 1700, f1: 1100, dur: .045, vol: .16 }); },
+  stick()  { tone({ type: 'sine', f0: 320, f1: 130, dur: .1, vol: .4 }); noise({ dur: .03, vol: .08, freq: 1800 }); },
+  pop(n) {
+    for (let i = 0; i < Math.min(n, 8); i++) {
+      tone({ type: 'sine', f0: 520 + i * 70, f1: 1700 + i * 120, dur: .09, vol: .22, delay: i * .03 });
+      noise({ dur: .05, vol: .1, freq: 4500, type: 'bandpass', q: 2, delay: i * .03 });
+    }
+  },
+  fall(n) {
+    const scale = [0, 2, 4, 7, 9];
+    for (let i = 0; i < Math.min(n + 2, 12); i++) {
+      const st = 24 - (Math.floor(i / 5) * 12 + scale[i % 5]);
+      tone({ type: 'triangle', f0: 523.25 * Math.pow(2, st / 12), dur: .12, vol: .14, delay: .08 + i * .045 });
+    }
+  },
+  ceiling() { noise({ dur: .35, vol: .6, freq: 260 }); tone({ type: 'square', f0: 120, f1: 50, dur: .25, vol: .14 }); },
+  hurry()   { tone({ type: 'square', f0: 1318, dur: .07, vol: .08 }); tone({ type: 'square', f0: 1318, dur: .07, vol: .08, delay: .1 }); },
+  ready()   { tone({ type: 'square', f0: 659, dur: .12, vol: .08 }); },
+  go()      { tone({ type: 'square', f0: 1318, dur: .3, vol: .09 }); tone({ type: 'triangle', f0: 659, dur: .3, vol: .12 }); },
+  clear() {
+    [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => {
+      const d = i === 6 ? .5 : .13;
+      tone({ type: 'square', f0: f, dur: d, vol: .08, delay: i * .12 });
+      tone({ type: 'triangle', f0: f / 2, dur: d, vol: .14, delay: i * .12 });
+    });
+  },
+  over() {
+    [523, 494, 466, 440, 415, 392].forEach((f, i) => tone({ type: 'square', f0: f, f1: f * .97, dur: i === 5 ? .7 : .2, vol: .08, delay: .3 + i * .22 }));
+    noise({ dur: .6, vol: .3, freq: 400 });
+  },
+};
+
+// ───────────── 격자 ─────────────
+let grid = [];
+const cols = r => (r & 1) ? COLS - 1 : COLS;
+function cellX(r, c) { return FX + R + c * D + ((r & 1) ? R : 0); }
+function ceilY() { return FY + drops * ROWH; }
+function cellY(r, base = ceilY()) { return base + R + r * ROWH; }
+function neighbors(r, c) {
+  const d = (r & 1) ? [[0, -1], [0, 1], [-1, 0], [-1, 1], [1, 0], [1, 1]]
+                    : [[0, -1], [0, 1], [-1, -1], [-1, 0], [1, -1], [1, 0]];
+  const out = [];
+  for (const [dr, dc] of d) {
+    const rr = r + dr, cc = c + dc;
+    if (rr < 0 || rr >= ROWS_MAX || cc < 0 || cc >= cols(rr)) continue;
+    out.push([rr, cc]);
+  }
+  return out;
+}
+const rand = n => Math.floor(Math.random() * n);
+function genBoard() {
+  grid = [];
+  for (let r = 0; r < ROWS_MAX; r++) grid.push(new Array(cols(r)).fill(-1));
+  // 원작 스테이지처럼 같은 색끼리 뭉치도록 생성
+  for (let r = 0; r < START_ROWS; r++) for (let c = 0; c < cols(r); c++) {
+    const nb = neighbors(r, c).filter(([a, b]) => grid[a][b] >= 0);
+    if (nb.length && Math.random() < .5) { const [a, b] = nb[rand(nb.length)]; grid[r][c] = grid[a][b]; }
+    else grid[r][c] = rand(NC);
+  }
+}
+function boardColors() {
+  const s = new Set();
+  for (const row of grid) for (const v of row) if (v >= 0) s.add(v);
+  return [...s];
+}
+function bubbleCount() { let n = 0; for (const row of grid) for (const v of row) if (v >= 0) n++; return n; }
+function pickColor() { const cs = boardColors(); return cs.length ? cs[rand(cs.length)] : rand(NC); }
+
+// ───────────── 게임 상태 ─────────────
+let state, stateT, score, shots, drops, ceilVis, cur, nxt, loadT, ball, idleT, lastCount;
+let pops = [], falls = [], sparks = [], texts = [];
+let aim = Math.PI / 2, time = 0;
+
+function reset() {
+  genBoard();
+  state = 'ready'; stateT = 0; score = 0; shots = 0; drops = 0; ceilVis = 0;
+  cur = pickColor(); nxt = pickColor(); loadT = 1; ball = null; idleT = 0; lastCount = -1;
+  pops = []; falls = []; sparks = []; texts = [];
+  resultEl.classList.remove('show');
+  readyBeeps = 0;
+}
+let readyBeeps = 0;
+
+function canFire() {
+  return state === 'play' && !ball && loadT >= 1 && Math.abs(ceilVis - drops * ROWH) < .5;
+}
+function fire() {
+  if (!canFire()) return;
+  ball = { x: LX, y: LY, vx: Math.cos(aim), vy: -Math.sin(aim), color: cur };
+  cur = nxt; nxt = pickColor(); loadT = 0;
+  idleT = 0; lastCount = -1;
+  SFX.shoot();
+}
+
+// 이동 + 충돌 (조준선 미리보기와 공용)
+const LEFT = FX + R, RIGHT = FX + FW - R, HIT2 = (D * .8) ** 2;
+function advance(b, dist, live) {
+  const top = ceilY();
+  while (dist > 0) {
+    const s = Math.min(dist, 3); dist -= s;
+    b.x += b.vx * s; b.y += b.vy * s;
+    if (b.x < LEFT) { b.x = 2 * LEFT - b.x; b.vx = Math.abs(b.vx); if (live) SFX.bounce(); }
+    else if (b.x > RIGHT) { b.x = 2 * RIGHT - b.x; b.vx = -Math.abs(b.vx); if (live) SFX.bounce(); }
+    if (b.y <= top + R) return true;
+    const rr = Math.floor((b.y - top - R) / ROWH);
+    for (let r = Math.max(0, rr - 1); r <= Math.min(ROWS_MAX - 1, rr + 2); r++) {
+      const y = cellY(r, top), dy = b.y - y;
+      if (dy * dy > HIT2) continue;
+      for (let c = 0; c < cols(r); c++) {
+        if (grid[r][c] < 0) continue;
+        const dx = b.x - cellX(r, c);
+        if (dx * dx + dy * dy < HIT2) return true;
+      }
+    }
+  }
+  return false;
+}
+function snapCell(x, y) {
+  let best = null, bd = Infinity;
+  for (let r = 0; r < ROWS_MAX - 1; r++) for (let c = 0; c < cols(r); c++) {
+    if (grid[r][c] >= 0) continue;
+    if (r !== 0 && !neighbors(r, c).some(([a, b]) => grid[a][b] >= 0)) continue;
+    const dx = x - cellX(r, c), dy = y - cellY(r), d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = [r, c]; }
+  }
+  return best;
+}
+function flood(r0, c0, test) {
+  const seen = new Set([r0 * 100 + c0]), out = [[r0, c0]];
+  for (let i = 0; i < out.length; i++) for (const [a, b] of neighbors(...out[i])) {
+    const k = a * 100 + b;
+    if (!seen.has(k) && test(a, b)) { seen.add(k); out.push([a, b]); }
+  }
+  return out;
+}
+
+function attach() {
+  const cell = snapCell(ball.x, ball.y);
+  const color = ball.color;
+  ball = null;
+  if (!cell) return;
+  const [r, c] = cell;
+  grid[r][c] = color;
+  shots++;
+
+  const group = flood(r, c, (a, b) => grid[a][b] === color);
+  if (group.length >= 3) {
+    for (const [a, b] of group) {
+      addPop(cellX(a, b), cellY(a), grid[a][b]);
+      grid[a][b] = -1;
+    }
+    score += group.length * 10;
+    SFX.pop(group.length);
+    // 천장과 끊긴 구슬 떨어뜨리기
+    const keep = new Set();
+    for (let k = 0; k < cols(0); k++) if (grid[0][k] >= 0)
+      for (const [a, b] of flood(0, k, (a, b) => grid[a][b] >= 0)) keep.add(a * 100 + b);
+    let fallen = 0, fx = 0, fy = 0;
+    for (let a = 0; a < ROWS_MAX; a++) for (let b = 0; b < cols(a); b++) {
+      if (grid[a][b] >= 0 && !keep.has(a * 100 + b)) {
+        const x = cellX(a, b), y = cellY(a);
+        falls.push({ x, y, vx: (Math.random() - .5) * 120, vy: -Math.random() * 220 - 40, color: grid[a][b], rot: 0 });
+        grid[a][b] = -1; fallen++; fx += x; fy += y;
+      }
+    }
+    if (fallen) {
+      // 원작 방식: 떨어뜨린 수 n개 → 10 × 2^n 점
+      const pts = 10 * Math.pow(2, Math.min(fallen, 17));
+      score += pts;
+      texts.push({ x: fx / fallen, y: fy / fallen, str: String(pts), t: 0 });
+      SFX.fall(fallen);
+    }
+  } else {
+    SFX.stick();
+  }
+
+  if (bubbleCount() === 0) { setState('clear'); SFX.clear(); return; }
+
+  if (shots % SHOTS_PER_DROP === 0) { drops++; SFX.ceiling(); }
+
+  if (isOver()) { setState('over'); SFX.over(); return; }
+
+  // 판에 남은 색만 나오도록 장전 구슬 갱신
+  const cs = boardColors();
+  if (!cs.includes(cur)) cur = pickColor();
+  if (!cs.includes(nxt)) nxt = pickColor();
+}
+function isOver() {
+  for (let r = 0; r < ROWS_MAX; r++) for (let c = 0; c < cols(r); c++)
+    if (grid[r][c] >= 0 && r + drops >= MAX_ROWS) return true;
+  return false;
+}
+function setState(s) { state = s; stateT = 0; }
+function showResult() {
+  state = 'result';
+  const cleared = !isOver() && bubbleCount() === 0;
+  const t = document.getElementById('resTitle');
+  t.textContent = cleared ? 'CLEAR!' : 'GAME OVER';
+  t.className = cleared ? 'clear' : 'over';
+  document.getElementById('resScore').textContent = score.toLocaleString();
+  resultEl.classList.add('show');
+}
+
+function addPop(x, y, color) {
+  pops.push({ x, y, color, t: 0 });
+  for (let i = 0; i < 7; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 200;
+    sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, life: .35 + Math.random() * .25, color: COLORS[color] });
+  }
+}
+
+// ───────────── 입력 ─────────────
+function toLocal(e) {
+  const rc = cv.getBoundingClientRect();
+  return [(e.clientX - rc.left) * W / rc.width, (e.clientY - rc.top) * H / rc.height];
+}
+addEventListener('mousemove', e => {
+  if (state !== 'play' && state !== 'ready') return;
+  const [x, y] = toLocal(e);
+  let a = Math.atan2(LY - y, x - LX);
+  if (a < 0) a = (x < LX) ? Math.PI : 0;        // 발사대 아래쪽이면 가까운 쪽 끝으로
+  aim = Math.max(MIN_ANGLE, Math.min(Math.PI - MIN_ANGLE, a));
+});
+cv.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  audioInit();
+  if (state !== 'play') return;   // 준비/결과 화면 중에는 무시
+  fire();                         // 날아가는 중이면 fire() 내부에서 무시
+});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+document.getElementById('retry').addEventListener('click', () => { audioInit(); reset(); });
+
+// ───────────── 업데이트 ─────────────
+function update(dt) {
+  time += dt; stateT += dt;
+  const tgt = drops * ROWH;
+  if (ceilVis < tgt) ceilVis = Math.min(tgt, ceilVis + dt * 160);
+
+  if (state === 'ready') {
+    if (readyBeeps === 0 && stateT > .1) { readyBeeps = 1; SFX.ready(); }
+    if (readyBeeps === 1 && stateT > 1.0) { readyBeeps = 2; SFX.go(); }
+    if (stateT > 1.5) setState('play');
+  } else if (state === 'play') {
+    if (loadT < 1) loadT = Math.min(1, loadT + dt / .16);
+    if (ball && advance(ball, SPEED * dt, true)) attach();
+    if (canFire()) {
+      idleT += dt;
+      if (idleT >= HURRY_AT) {
+        const n = Math.ceil(AUTOFIRE_AT - idleT);
+        if (n !== lastCount) { lastCount = n; SFX.hurry(); }
+        if (idleT >= AUTOFIRE_AT) fire();
+      }
+    }
+  } else if (state === 'over') {
+    if (stateT > 2.0) showResult();
+  } else if (state === 'clear') {
+    if (stateT > 2.4) showResult();
+  }
+
+  for (const p of pops) p.t += dt;
+  pops = pops.filter(p => p.t < .32);
+  for (const s of sparks) { s.t += dt; s.x += s.vx * dt; s.y += s.vy * dt; s.vx *= .94; s.vy = s.vy * .94 + 300 * dt; }
+  sparks = sparks.filter(s => s.t < s.life);
+  for (const f of falls) { f.vy += 1500 * dt; f.x += f.vx * dt; f.y += f.vy * dt; if (f.x < LEFT || f.x > RIGHT) { f.vx = -f.vx; f.x = Math.max(LEFT, Math.min(RIGHT, f.x)); } }
+  falls = falls.filter(f => f.y < H + D);
+  for (const t of texts) t.t += dt;
+  texts = texts.filter(t => t.t < 1.1);
+}
+
+// ───────────── 그리기 ─────────────
+function text(str, x, y, size, fill, stroke = '#120c34', align = 'center', lw = 5) {
+  ctx.font = `900 ${size}px "Arial Black", Impact, sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round'; ctx.lineWidth = lw; ctx.strokeStyle = stroke; ctx.strokeText(str, x, y);
+  ctx.fillStyle = fill; ctx.fillText(str, x, y);
+}
+
+function drawCeiling() {
+  const y1 = FY + ceilVis;
+  if (ceilVis > 0) {
+    const g = ctx.createLinearGradient(0, FY, 0, y1);
+    g.addColorStop(0, '#3b4058'); g.addColorStop(1, '#757b94');
+    ctx.fillStyle = g; ctx.fillRect(FX, FY, FW, ceilVis);
+    ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2;
+    for (let i = 1; i <= drops; i++) {
+      const yy = y1 - i * ROWH + 1;
+      ctx.beginPath(); ctx.moveTo(FX, yy); ctx.lineTo(FX + FW, yy); ctx.stroke();
+    }
+    ctx.fillStyle = '#c8ccdc';
+    for (let i = 0; i < drops; i++) for (let x = FX + 22; x < FX + FW; x += 44) {
+      ctx.beginPath(); ctx.arc(x, y1 - i * ROWH - ROWH / 2, 2.5, 0, 7); ctx.fill();
+    }
+  }
+  // 천장 아래 테두리
+  const g2 = ctx.createLinearGradient(0, y1 - 6, 0, y1 + 2);
+  g2.addColorStop(0, '#9aa0b8'); g2.addColorStop(.5, '#f0f2fa'); g2.addColorStop(1, '#55596e');
+  ctx.fillStyle = g2; ctx.fillRect(FX, y1 - 6, FW, 8);
+}
+
+function drawGrid() {
+  const base = FY + ceilVis;
+  const warn = shots % SHOTS_PER_DROP;
+  const amp = state === 'play' ? (warn === SHOTS_PER_DROP - 1 ? 2.2 : warn === SHOTS_PER_DROP - 2 ? 1 : 0) : 0;
+  const grayFrom = state === 'over' ? MAX_ROWS + 1 - stateT * 14 : Infinity;
+  for (let r = 0; r < ROWS_MAX; r++) for (let c = 0; c < cols(r); c++) {
+    const v = grid[r][c]; if (v < 0) continue;
+    let x = cellX(r, c), y = base + R + r * ROWH;
+    if (amp) { x += Math.sin(time * 60 + r * 3 + c * 7) * amp; y += Math.cos(time * 55 + c * 5) * amp * .5; }
+    drawBubble(r + drops >= grayFrom ? SPR_GRAY : SPR[v], x, y);
+  }
+}
+
+function drawDeadline() {
+  let danger = false;
+  for (let r = 0; r < ROWS_MAX && !danger; r++) for (let c = 0; c < cols(r); c++)
+    if (grid[r][c] >= 0 && r + drops >= MAX_ROWS - 2) { danger = true; break; }
+  ctx.save();
+  ctx.setLineDash([10, 6]); ctx.lineWidth = 3;
+  const a = danger ? .55 + .45 * Math.sin(time * 10) : .85;
+  ctx.strokeStyle = `rgba(255,${danger ? 70 : 120},${danger ? 70 : 140},${a})`;
+  ctx.beginPath(); ctx.moveTo(FX, DEADY); ctx.lineTo(FX + FW, DEADY); ctx.stroke();
+  ctx.restore();
+}
+
+function drawGuide() {
+  if (state !== 'play' || ball) return;
+  const b = { x: LX, y: LY, vx: Math.cos(aim), vy: -Math.sin(aim) };
+  const pts = [];
+  let total = 0;
+  const off = (time * 60) % 16;
+  advance(b, off, false);
+  while (total < 1400) {
+    pts.push([b.x, b.y]);
+    if (advance(b, 16, false)) break;
+    total += 16;
+  }
+  for (let i = 1; i < pts.length; i++) {
+    const [x, y] = pts[i];
+    if (y > LY - R - 4) continue;
+    const a = Math.max(.15, .85 - i * .012);
+    ctx.beginPath(); ctx.arc(x, y, 2.6, 0, 7);
+    ctx.fillStyle = `rgba(255,255,255,${a})`; ctx.fill();
+  }
+}
+
+function drawLauncher() {
+  // 받침
+  ctx.save();
+  ctx.translate(LX, LY);
+  const g = ctx.createRadialGradient(-8, -10, 4, 0, 0, 44);
+  g.addColorStop(0, '#f4f6ff'); g.addColorStop(.6, '#8d93ab'); g.addColorStop(1, '#3a3e52');
+  // 톱니
+  ctx.fillStyle = '#545a72';
+  for (let i = 0; i < 14; i++) {
+    ctx.save(); ctx.rotate(i / 14 * Math.PI * 2 + aim * .5);
+    ctx.fillRect(-4, -42, 8, 10); ctx.restore();
+  }
+  ctx.beginPath(); ctx.arc(0, 0, 35, 0, 7); ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#2a2e40'; ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, 0, 27, 0, 7); ctx.fillStyle = '#23283e'; ctx.fill();
+
+  // 화살표
+  ctx.rotate(-aim + Math.PI / 2);
+  const ag = ctx.createLinearGradient(-6, 0, 6, 0);
+  ag.addColorStop(0, '#b07a10'); ag.addColorStop(.45, '#ffe680'); ag.addColorStop(1, '#a0680a');
+  ctx.fillStyle = ag; ctx.strokeStyle = '#4a2c00'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(-5, 10); ctx.lineTo(-5, -62); ctx.lineTo(-12, -62); ctx.lineTo(0, -84);
+  ctx.lineTo(12, -62); ctx.lineTo(5, -62); ctx.lineTo(5, 10); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.restore();
+
+  // 장전 구슬 (다음 구슬 자리에서 굴러 들어옴)
+  const gray = state === 'over' && stateT > .6;
+  if (state !== 'clear') {
+    const e = 1 - Math.pow(1 - loadT, 3);
+    drawBubble(gray ? SPR_GRAY : SPR[cur], NEXT_X + (LX - NEXT_X) * e, NEXT_Y + (LY - NEXT_Y) * e);
+  }
+}
+
+function drawNext() {
+  // 미리보기 창
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,12,40,.75)'; ctx.strokeStyle = '#9aa3c8'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(NEXT_X - 32, NEXT_Y - 46, 64, 74, 10); ctx.fill(); ctx.stroke();
+  ctx.restore();
+  text('NEXT', NEXT_X, NEXT_Y - 33, 13, '#9fdcff', '#0b0f2c', 'center', 4);
+  if (state === 'clear') return;
+  const s = loadT < 1 ? .4 + .6 * loadT : 1;
+  drawBubble(state === 'over' && stateT > .6 ? SPR_GRAY : SPR[nxt], NEXT_X, NEXT_Y, s);
+}
+
+function drawHUD() {
+  text('SCORE', FX + 8, 34, 15, '#9fdcff', '#0b0f2c', 'left', 4);
+  text(String(score).padStart(8, '0'), FX + FW - 8, 35, 26, '#ffe23a', '#3a1a00', 'right', 5);
+  // 천장 하강까지 남은 발사 수 (오른쪽 아래 램프)
+  const left = SHOTS_PER_DROP - (shots % SHOTS_PER_DROP);
+  const bx = FX + FW - 18, by = NEXT_Y + 4;
+  for (let i = 0; i < SHOTS_PER_DROP; i++) {
+    const on = i < left;
+    ctx.beginPath(); ctx.arc(bx - (i % 4) * 14, by - Math.floor(i / 4) * 14 - 8, 4.5, 0, 7);
+    ctx.fillStyle = on ? (left <= 2 ? '#ff4d4d' : '#66e07a') : 'rgba(255,255,255,.12)';
+    ctx.fill();
+  }
+}
+
+function drawEffects() {
+  for (const f of falls) drawBubble(SPR[f.color], f.x, f.y);
+  for (const p of pops) {
+    const k = p.t / .32;
+    if (p.t < .07) drawBubble(SPR_WHITE, p.x, p.y, 1.05);
+    else drawBubble(SPR[p.color], p.x, p.y, 1 + k * .55, Math.max(0, 1 - k));
+  }
+  for (const s of sparks) {
+    const a = 1 - s.t / s.life, sz = 5 * a + 1.5;
+    ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(s.t * 12);
+    ctx.globalAlpha = a; ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const rr = i & 1 ? sz * .35 : sz, an = i * Math.PI / 4;
+      ctx.lineTo(Math.cos(an) * rr, Math.sin(an) * rr);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = s.color; ctx.beginPath(); ctx.arc(0, 0, sz * .3, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+  for (const t of texts) {
+    ctx.globalAlpha = Math.min(1, (1.1 - t.t) * 3);
+    text(t.str, t.x, t.y - t.t * 50, 20, '#fff', '#c0206a');
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawMessages() {
+  const cx = FX + FW / 2, cy = FY + (DEADY - FY) * .55;
+  if (state === 'ready') {
+    const t = stateT;
+    if (t < 1.0) { const s = Math.min(1, t * 6); text('READY?', cx, cy, 40 * s, '#ffe23a', '#3a1a00', 'center', 7); }
+    else { const s = 1 + (t - 1) * 1.2; ctx.globalAlpha = Math.max(0, 1 - (t - 1) * 2); text('GO!', cx, cy, 52 * s, '#ff5a7a', '#3a0010', 'center', 8); ctx.globalAlpha = 1; }
+  } else if (state === 'play' && idleT >= HURRY_AT && !ball) {
+    if (Math.floor(time * 4) % 2 === 0) text('HURRY UP!', cx, cy, 34, '#ff4d4d', '#2a0000', 'center', 7);
+    text(String(Math.max(1, Math.ceil(AUTOFIRE_AT - idleT))), LX, LY - 66, 28, '#fff', '#2a0000', 'center', 6);
+  } else if (state === 'clear') {
+    const s = Math.min(1, stateT * 4), bob = Math.sin(stateT * 6) * 6;
+    text('CLEAR!', cx, cy + bob, 54 * s, '#ffe23a', '#3a1a00', 'center', 8);
+  } else if (state === 'over' && stateT > 1) {
+    text('GAME OVER', cx, cy, 40, '#ff5a5a', '#2a0000', 'center', 7);
+  }
+}
+
+function draw() {
+  ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+  ctx.drawImage(bg, 0, 0, W, H);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(FX, FY - 6, FW, H - FY + 6); ctx.clip();
+  drawGrid();
+  drawCeiling();
+  drawDeadline();
+  drawGuide();
+  drawNext();
+  drawLauncher();
+  if (ball) drawBubble(SPR[ball.color], ball.x, ball.y);
+  drawEffects();
+  ctx.restore();
+  drawHUD();
+  drawMessages();
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

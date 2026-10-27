@@ -1,10 +1,10 @@
 # 버블 슈터
 
-퍼즐보블 스타일의 버블슈터 웹 게임입니다. `index.html` 파일 하나로 동작합니다.
+퍼즐보블 스타일의 버블슈터 웹 게임입니다. `bubble-shooter/index.html` 파일 하나로 동작합니다.
 
 ## ▶ 플레이하기
 
-**https://hailey1220.github.io/Pair-Programming/**
+**https://hailey1220.github.io/Pair-Programming/bubble-shooter/**
 
 ## 조작
 
